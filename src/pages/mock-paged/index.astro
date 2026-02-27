@@ -1,0 +1,616 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const emojiDir = path.resolve('public/EmojiMockPacks');
+const dirs = fs.readdirSync(emojiDir).filter((d: string) => {
+  return fs.statSync(path.join(emojiDir, d)).isDirectory();
+}).sort((a: string, b: string) => Number(a) - Number(b));
+
+const items = dirs.map((d: string) => ({
+  id: d,
+  basePath: `/EmojiMockPacks/${d}/${d}`,
+}));
+---
+
+<Layout title="Mock Paged View - Emoji Viewer" activeTab="mock-paged">
+  <div class="grid-info">
+    <span id="page-info">0 items</span>
+    <div class="grid-controls">
+      <div class="format-switcher">
+        <button class="format-btn format-btn--active" data-format="gif">GIF</button>
+      </div>
+      <button class="format-btn format-btn--active" id="btn-paged" title="Paged Mode">PAGED</button>
+      <button class="format-btn" id="btn-auto" title="Auto Page Flip">AUTO</button>
+      <button class="format-btn" id="btn-lazy" title="loading attribute">LOAD:OFF</button>
+      <button class="format-btn" id="btn-decode" title="decoding attribute">DEC:OFF</button>
+      <button class="format-btn" id="btn-cv" title="content-visibility">CV:OFF</button>
+      <div class="page-nav" id="page-nav">
+        <button class="page-btn" id="btn-prev" title="Previous Page">&laquo; Prev</button>
+        <span id="page-indicator">1 / 1</span>
+        <button class="page-btn" id="btn-next" title="Next Page">Next &raquo;</button>
+      </div>
+    </div>
+  </div>
+  <div id="grid-container" class="grid-scroll-container">
+    <div id="emoji-grid" class="emoji-grid"></div>
+  </div>
+
+  <!-- Preview overlay -->
+  <div id="preview-overlay" class="preview-overlay" style="display:none;">
+    <div class="preview-content">
+      <img id="preview-img" src="" alt="preview" />
+      <button class="preview-close" id="preview-close">&times;</button>
+    </div>
+  </div>
+</Layout>
+
+<script define:vars={{ items }}>
+  // Pass server-side data to client
+  window.__EMOJI_ITEMS__ = items;
+</script>
+
+<script>
+  const allItems = (window as any).__EMOJI_ITEMS__ as Array<{ id: string; basePath: string }>;
+
+  // --- URL params helpers ---
+  const LOADING_STATES: (string | null)[] = [null, 'lazy', 'eager'];
+  const DECODING_STATES: (string | null)[] = [null, 'sync', 'async'];
+  const CV_STATES: (string | null)[] = [null, 'auto', 'hidden'];
+
+  function getUrlParams() {
+    return new URLSearchParams(window.location.search);
+  }
+
+  function idxOf(states: (string | null)[], val: string | null): number {
+    if (val === null || val === 'off') return 0;
+    const i = states.indexOf(val);
+    return i >= 0 ? i : 0;
+  }
+
+  function initState() {
+    const p = getUrlParams();
+    return {
+      fmt: 'gif',
+      paged: p.get('paged') !== '0',
+      auto: p.get('auto') === '1',
+      page: Math.max(0, parseInt(p.get('page') || '0', 10) || 0),
+      loadIdx: idxOf(LOADING_STATES, p.get('load')),
+      decIdx: idxOf(DECODING_STATES, p.get('dec')),
+      cvIdx: idxOf(CV_STATES, p.get('cv')),
+    };
+  }
+
+  const init = initState();
+
+  // --- State ---
+  let currentFormat = init.fmt;
+  let pagedEnabled = init.paged;
+  let autoEnabled = init.auto;
+
+  // Tri-state cycling
+  let loadingIdx = init.loadIdx;
+  let decodingIdx = init.decIdx;
+  let cvIdx = init.cvIdx;
+  let currentPage = init.page;
+  let columns = 6;
+  let rows = 5;
+  let autoTimer: ReturnType<typeof setInterval> | null = null;
+
+  function syncUrl() {
+    const p = new URLSearchParams();
+    if (!pagedEnabled) p.set('paged', '0');
+    if (autoEnabled) p.set('auto', '1');
+    if (currentPage > 0) p.set('page', String(currentPage));
+    const ld = LOADING_STATES[loadingIdx];
+    if (ld) p.set('load', ld); else if (getUrlParams().has('load')) p.set('load', 'off');
+    const dc = DECODING_STATES[decodingIdx];
+    if (dc) p.set('dec', dc); else if (getUrlParams().has('dec')) p.set('dec', 'off');
+    const cv = CV_STATES[cvIdx];
+    if (cv) p.set('cv', cv); else if (getUrlParams().has('cv')) p.set('cv', 'off');
+    const qs = p.toString();
+    const newUrl = qs ? `${window.location.pathname}?${qs}` : window.location.pathname;
+    window.history.replaceState(null, '', newUrl);
+  }
+
+  // --- DOM refs ---
+  const grid = document.getElementById('emoji-grid')!;
+  const gridContainer = document.getElementById('grid-container')!;
+  const pageInfo = document.getElementById('page-info')!;
+  const pageNav = document.getElementById('page-nav')!;
+  const pageIndicator = document.getElementById('page-indicator')!;
+  const btnPrev = document.getElementById('btn-prev')!;
+  const btnNext = document.getElementById('btn-next')!;
+  const btnPaged = document.getElementById('btn-paged')!;
+  const btnAuto = document.getElementById('btn-auto')!;
+  const btnLazy = document.getElementById('btn-lazy')!;
+  const btnDecode = document.getElementById('btn-decode')!;
+  const btnCv = document.getElementById('btn-cv')!;
+  const previewOverlay = document.getElementById('preview-overlay')!;
+  const previewImg = document.getElementById('preview-img') as HTMLImageElement;
+  const previewClose = document.getElementById('preview-close')!;
+  const formatBtns = document.querySelectorAll<HTMLButtonElement>('[data-format]');
+
+  // --- Fixed img element pool ---
+  const PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+  let imgCells: HTMLDivElement[] = [];
+  let imgElements: HTMLImageElement[] = [];
+
+  function getColumns(): number {
+    const w = window.innerWidth;
+    if (w < 480) return 3;
+    if (w < 768) return 4;
+    if (w < 1024) return 5;
+    return 6;
+  }
+
+  function getRows(): number {
+    const containerH = gridContainer.clientHeight;
+    const cellSize = Math.floor(gridContainer.clientWidth / columns);
+    return Math.max(1, Math.floor(containerH / cellSize));
+  }
+
+  function getPageSize(): number {
+    return columns * rows;
+  }
+
+  function getTotalPages(): number {
+    return Math.max(1, Math.ceil(allItems.length / getPageSize()));
+  }
+
+  function getSrc(item: { id: string; basePath: string }): string {
+    return `${item.basePath}.${currentFormat}`;
+  }
+
+  /** Build the fixed grid of img elements (called on init and resize) */
+  function buildGrid() {
+    columns = getColumns();
+    rows = getRows();
+    const count = pagedEnabled ? getPageSize() : allItems.length;
+
+    grid.style.gridTemplateColumns = `repeat(${columns}, 1fr)`;
+
+    // Reuse or create cells
+    while (imgCells.length > count) {
+      const cell = imgCells.pop()!;
+      imgElements.pop();
+      cell.remove();
+    }
+    while (imgCells.length < count) {
+      const cell = document.createElement('div');
+      cell.className = 'emoji-cell';
+      const img = document.createElement('img');
+      img.src = PLACEHOLDER;
+      img.alt = '';
+      const ld = LOADING_STATES[loadingIdx];
+      if (ld) img.loading = ld as any;
+      const dc = DECODING_STATES[decodingIdx];
+      if (dc) img.decoding = dc as any;
+      cell.appendChild(img);
+      cell.addEventListener('click', () => {
+        const src = img.getAttribute('src');
+        if (src && src !== PLACEHOLDER) {
+          previewImg.src = src;
+          previewOverlay.style.display = 'flex';
+        }
+      });
+      grid.appendChild(cell);
+      imgCells.push(cell);
+      imgElements.push(img);
+    }
+  }
+
+  /** Update img src values for the current page or all items */
+  function renderPage() {
+    const pageSize = getPageSize();
+    const totalPages = getTotalPages();
+
+    if (pagedEnabled) {
+      if (currentPage >= totalPages) currentPage = totalPages - 1;
+      if (currentPage < 0) currentPage = 0;
+
+      const start = currentPage * pageSize;
+      const pageItems = allItems.slice(start, start + pageSize);
+
+      // Ensure we have the right number of cells
+      if (imgElements.length !== pageSize) {
+        buildGrid();
+      }
+
+      for (let i = 0; i < imgElements.length; i++) {
+        if (i < pageItems.length) {
+          const newSrc = getSrc(pageItems[i]);
+          imgCells[i].style.visibility = 'visible';
+          if (imgElements[i].src !== newSrc) {
+            imgElements[i].src = newSrc;
+          }
+          imgElements[i].alt = pageItems[i].id;
+        } else {
+          imgCells[i].style.visibility = 'hidden';
+          imgElements[i].src = PLACEHOLDER;
+          imgElements[i].alt = '';
+        }
+      }
+
+      pageIndicator.textContent = `${currentPage + 1} / ${totalPages}`;
+      pageNav.style.display = 'flex';
+      pageInfo.textContent = `${allItems.length} items · Page ${currentPage + 1}/${totalPages} (${pageSize}/page)`;
+      gridContainer.style.overflow = 'hidden';
+    } else {
+      // Non-paged: show all items
+      for (let i = 0; i < imgElements.length; i++) {
+        if (i < allItems.length) {
+          const newSrc = getSrc(allItems[i]);
+          imgCells[i].style.visibility = 'visible';
+          if (imgElements[i].src !== newSrc) {
+            imgElements[i].src = newSrc;
+          }
+          imgElements[i].alt = allItems[i].id;
+        } else {
+          imgCells[i].style.visibility = 'hidden';
+          imgElements[i].src = PLACEHOLDER;
+        }
+      }
+      pageNav.style.display = 'none';
+      pageInfo.textContent = `${allItems.length} items`;
+      gridContainer.style.overflow = 'auto';
+    }
+  }
+
+  // --- Event handlers ---
+
+  function goNextPage() {
+    const totalPages = getTotalPages();
+    currentPage = (currentPage + 1) % totalPages;
+    renderPage();
+    syncUrl();
+  }
+
+  function goPrevPage() {
+    const totalPages = getTotalPages();
+    currentPage = (currentPage - 1 + totalPages) % totalPages;
+    renderPage();
+    syncUrl();
+  }
+
+  function startAutoFlip() {
+    stopAutoFlip();
+    autoTimer = setInterval(() => {
+      goNextPage();
+    }, 5000);
+  }
+
+  function stopAutoFlip() {
+    if (autoTimer !== null) {
+      clearInterval(autoTimer);
+      autoTimer = null;
+    }
+  }
+
+  function togglePaged() {
+    pagedEnabled = !pagedEnabled;
+    btnPaged.classList.toggle('format-btn--active', pagedEnabled);
+    currentPage = 0;
+
+    if (!pagedEnabled) {
+      autoEnabled = false;
+      btnAuto.classList.toggle('format-btn--active', false);
+      stopAutoFlip();
+    }
+
+    buildGrid();
+    renderPage();
+    syncUrl();
+  }
+
+  function toggleAuto() {
+    if (!pagedEnabled) {
+      pagedEnabled = true;
+      btnPaged.classList.add('format-btn--active');
+      currentPage = 0;
+      buildGrid();
+    }
+
+    autoEnabled = !autoEnabled;
+    btnAuto.classList.toggle('format-btn--active', autoEnabled);
+
+    if (autoEnabled) {
+      startAutoFlip();
+    } else {
+      stopAutoFlip();
+    }
+    renderPage();
+    syncUrl();
+  }
+
+  function applyImgAttrs() {
+    const ld = LOADING_STATES[loadingIdx];
+    const dc = DECODING_STATES[decodingIdx];
+    for (const img of imgElements) {
+      if (ld) {
+        img.loading = ld as any;
+      } else {
+        img.removeAttribute('loading');
+      }
+      if (dc) {
+        img.decoding = dc as any;
+      } else {
+        img.removeAttribute('decoding');
+      }
+    }
+  }
+
+  function applyCvAuto() {
+    const cv = CV_STATES[cvIdx];
+    for (const cell of imgCells) {
+      if (cv) {
+        cell.style.contentVisibility = cv;
+        cell.style.containIntrinsicSize = '0 auto';
+      } else {
+        cell.style.contentVisibility = '';
+        cell.style.containIntrinsicSize = '';
+      }
+    }
+  }
+
+  function updateBtnLabel(btn: HTMLElement, prefix: string, states: (string | null)[], idx: number) {
+    const val = states[idx];
+    btn.textContent = val ? `${prefix}:${val.toUpperCase()}` : `${prefix}:OFF`;
+    btn.classList.toggle('format-btn--active', val !== null);
+  }
+
+  function toggleLazy() {
+    loadingIdx = (loadingIdx + 1) % LOADING_STATES.length;
+    updateBtnLabel(btnLazy, 'LOAD', LOADING_STATES, loadingIdx);
+    applyImgAttrs();
+    syncUrl();
+  }
+
+  function toggleDecode() {
+    decodingIdx = (decodingIdx + 1) % DECODING_STATES.length;
+    updateBtnLabel(btnDecode, 'DEC', DECODING_STATES, decodingIdx);
+    applyImgAttrs();
+    syncUrl();
+  }
+
+  function toggleCvAuto() {
+    cvIdx = (cvIdx + 1) % CV_STATES.length;
+    updateBtnLabel(btnCv, 'CV', CV_STATES, cvIdx);
+    applyCvAuto();
+    syncUrl();
+  }
+
+  // --- Bind events ---
+
+  btnPaged.addEventListener('click', togglePaged);
+  btnAuto.addEventListener('click', toggleAuto);
+  btnLazy.addEventListener('click', toggleLazy);
+  btnDecode.addEventListener('click', toggleDecode);
+  btnCv.addEventListener('click', toggleCvAuto);
+  btnPrev.addEventListener('click', goPrevPage);
+  btnNext.addEventListener('click', goNextPage);
+
+  previewOverlay.addEventListener('click', () => {
+    previewOverlay.style.display = 'none';
+  });
+  previewClose.addEventListener('click', () => {
+    previewOverlay.style.display = 'none';
+  });
+  previewOverlay.querySelector('.preview-content')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+  });
+
+  // Keyboard navigation
+  document.addEventListener('keydown', (e) => {
+    if (!pagedEnabled) return;
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      goPrevPage();
+    } else if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ') {
+      e.preventDefault();
+      goNextPage();
+    } else if (e.key === 'Escape') {
+      previewOverlay.style.display = 'none';
+    }
+  });
+
+  // Resize handler
+  let resizeTimer: ReturnType<typeof setTimeout>;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      buildGrid();
+      renderPage();
+    }, 150);
+  });
+
+  // --- Init ---
+  btnPaged.classList.toggle('format-btn--active', pagedEnabled);
+  btnAuto.classList.toggle('format-btn--active', autoEnabled);
+  updateBtnLabel(btnLazy, 'LOAD', LOADING_STATES, loadingIdx);
+  updateBtnLabel(btnDecode, 'DEC', DECODING_STATES, decodingIdx);
+  updateBtnLabel(btnCv, 'CV', CV_STATES, cvIdx);
+
+  buildGrid();
+  applyImgAttrs();
+  applyCvAuto();
+  renderPage();
+
+  if (autoEnabled) {
+    startAutoFlip();
+  }
+</script>
+
+<style>
+  .grid-info {
+    padding: 8px 0 12px;
+    font-size: 0.85rem;
+    color: #666;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .grid-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .format-switcher {
+    display: flex;
+    gap: 4px;
+  }
+
+  .format-btn {
+    padding: 3px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.05);
+    color: #999;
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    letter-spacing: 0.5px;
+  }
+
+  .format-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: #ccc;
+  }
+
+  .format-btn--active {
+    background: #667eea;
+    border-color: #667eea;
+    color: #fff;
+  }
+
+  .format-btn--active:hover {
+    background: #5a6fd6;
+  }
+
+  .page-nav {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .page-btn {
+    padding: 3px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.05);
+    color: #ccc;
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+
+  .page-btn:hover {
+    background: rgba(255, 255, 255, 0.15);
+    color: #fff;
+  }
+
+  #page-indicator {
+    color: #888;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+    min-width: 60px;
+    text-align: center;
+  }
+
+  .grid-scroll-container {
+    height: calc(100vh - 160px);
+    overflow: auto;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  .emoji-grid {
+    display: grid;
+    gap: 8px;
+    padding: 4px 12px;
+  }
+
+  .emoji-grid :global(.emoji-cell) {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    aspect-ratio: 1;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 10px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    overflow: hidden;
+  }
+
+  .emoji-grid :global(.emoji-cell:hover) {
+    background: rgba(255, 255, 255, 0.1);
+    transform: scale(1.05);
+  }
+
+  .emoji-grid :global(.emoji-cell img) {
+    max-width: 80%;
+    max-height: 80%;
+    object-fit: contain;
+  }
+
+  .preview-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    background: rgba(0, 0, 0, 0.8);
+    backdrop-filter: blur(8px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: fadeIn 0.2s ease;
+  }
+
+  .preview-content {
+    position: relative;
+    max-width: 90vw;
+    max-height: 90vh;
+  }
+
+  .preview-content img {
+    max-width: 400px;
+    max-height: 400px;
+    border-radius: 12px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  }
+
+  .preview-close {
+    position: absolute;
+    top: -12px;
+    right: -12px;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: none;
+    background: #333;
+    color: #fff;
+    font-size: 1.2rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s;
+  }
+
+  .preview-close:hover {
+    background: #555;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+</style>

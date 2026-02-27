@@ -1,0 +1,25 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import EmojiGrid from '../../components/EmojiGrid.tsx';
+import PerfMonitor from '../../components/PerfMonitor.tsx';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const emojiDir = path.resolve('public/EmojiMockPacks');
+const dirs = fs.readdirSync(emojiDir).filter((d: string) => {
+  return fs.statSync(path.join(emojiDir, d)).isDirectory();
+}).sort((a: string, b: string) => Number(a) - Number(b));
+
+const items = dirs.map((d: string) => ({
+  id: d,
+  src: `/EmojiMockPacks/${d}/${d}.gif`,
+  basePath: `/EmojiMockPacks/${d}/${d}`,
+}));
+
+const formats = ['gif', 'canvas'];
+---
+
+<Layout title="Mock GIF Packs - Emoji Viewer" activeTab="mock">
+  <EmojiGrid client:load items={items} formats={formats} defaultFormat="gif" />
+  <PerfMonitor client:load />
+</Layout>
